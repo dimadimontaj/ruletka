@@ -6,7 +6,7 @@ import (
 
 	"database/sql"
 	"cases/migrations"
-	"cases/logger"
+	"cases/pkg/logger"
 )
 
 // контейнер внешних зависимостей приложения

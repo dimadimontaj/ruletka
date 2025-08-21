@@ -1,9 +1,10 @@
-package: http
+package: generated
 generate:
   chi-server: true
+  embedded-spec: true
   models: true
   strict-server: true
-output: internal/transport/http/oapi_server.gen.go
+output: internal/generated/oapi_server.gen.go
 compatibility:
   old-enum-conflicts: true
   

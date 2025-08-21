@@ -1,8 +1,8 @@
 package cmd
 
 import (
-	"github.com/timurzdev/mentorship-test-task/internal/handler/server"
-	"github.com/timurzdev/mentorship-test-task/internal/repository"
+	"cases/internal/handlers/server"
+	"cases/internal/repository"
 )
 
 // контейнер внутренних зависимостей

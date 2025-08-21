@@ -2,4 +2,4 @@ package: apiclient
 generate:
   client: true
   models: true
-output: internal/transport/http/oapi_client.gen.go
+output: internal/generated/oapi_client.gen.go

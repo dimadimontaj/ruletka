@@ -1,0 +1,8 @@
+package: http
+generate:
+  chi-server: true
+  models: true
+  strict-server: true
+output: internal/transport/http/oapi_server.gen.go
+compatibility:
+  old-enum-conflicts: true

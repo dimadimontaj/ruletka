@@ -1,0 +1,1089 @@
+openapi: 3.0.0
+info:
+  title: Telegram Mini App — Cases & Stickers API (MVP)
+  version: 1.0.0
+  description: |
+    API покрывает авторизацию через Telegram Web Apps, каталог кейсов, открытие кейсов с идемпотентностью,
+    инвентарь пользователя, платежи (Telegram Stars / Bot Payments), а также базовый админ‑API.
+    
+    Примечания по проектированию:
+    - Все мутирующие операции поддерживают идемпотентность через заголовок `Idempotency-Key`.
+    - Авторизация клиента после выдачи токена осуществляется через Bearer JWT.
+    - В /auth/telegram передается строка `init_data` из Telegram Web Apps для серверной проверки подписи.
+    - Для прозрачности RNG можно опционально возвращать `batch_seed_hash`.
+    - Реализованы поля для будущей «pity» механики без влияния на контракт.
+servers:
+  - url: https://api.example.com
+    description: Продакшн
+  - url: https://staging-api.example.com
+    description: Staging
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+    description: Авторизация и профиль
+  - name: Users
+    description: Профиль пользователя и баланс
+  - name: Cases
+    description: Каталог, детали и открытие кейсов
+  - name: Drops
+    description: История дропов
+  - name: Inventory
+    description: Инвентарь пользователя
+  - name: Payments
+    description: Пополнение баланса и вебхуки
+  - name: Admin
+    description: Внутренний админ‑API (требует роль admin)
+  - name: Webhooks
+    description: Входящие вебхуки от платежных провайдеров
+  - name: Health
+    description: Технические эндпойнты для мониторинга
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Проверка статуса сервиса
+      responses:
+        '200':
+            description: ОК
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    status:
+                      type: string
+                      example: ok
+                    time:
+                      type: string
+                      format: date-time
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /auth/telegram:
+    post:
+      tags: [Auth]
+      summary: Авторизация по Telegram Web Apps init_data
+      description: |
+        Принимает `init_data` из Telegram Web Apps, валидирует HMAC/подпись и создает/находит пользователя.
+        Возвращает профиль и пару токенов `access_token`/`refresh_token`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [init_data]
+              properties:
+                init_data:
+                  type: string
+                  description: Строка initData из Telegram Web Apps (URL-encoded), как есть.
+                device_fingerprint:
+                  type: string
+                  description: Необязательно. Хэш устройства/сессии для анти‑фрод логики.
+      responses:
+        '200':
+          description: Успешная авторизация
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/X-RateLimit-Limit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/X-RateLimit-Remaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/X-RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /me:
+    get:
+      tags: [Users]
+      summary: Текущий пользователь — профиль, баланс и краткая статистика
+      responses:
+        '200':
+          description: Профиль и баланс
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/X-RateLimit-Limit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/X-RateLimit-Remaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/X-RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /cases:
+    get:
+      tags: [Cases]
+      summary: Список активных кейсов
+      parameters:
+        - $ref: '#/components/parameters/PageLimit'
+        - $ref: '#/components/parameters/PageOffset'
+      responses:
+        '200':
+          description: Коллекция кейсов
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CaseSummary'
+                  total:
+                    type: integer
+                    minimum: 0
+                    example: 2
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /cases/{case_id}:
+    get:
+      tags: [Cases]
+      summary: Детали кейса (без точных весов предметов)
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Детали кейса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetails'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cases/{case_id}/open:
+    post:
+      tags: [Cases]
+      summary: Открыть кейс (идемпотентно)
+      description: |
+        Списывает стоимость, выполняет RNG, фиксирует дроп и возвращает результат и обновленный баланс.
+        Повтор с тем же `Idempotency-Key` вернет тот же результат.
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Результат открытия кейса
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/X-RateLimit-Limit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/X-RateLimit-Remaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/X-RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenCaseResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          description: Недостаточно средств
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Конкурирующие операции или повтор без Idempotency-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /drops/my:
+    get:
+      tags: [Drops]
+      summary: Мои последние дропы
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+          description: Количество последних дропов (до 50)
+      responses:
+        '200':
+          description: Дропы пользователя
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Drop'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /inventory:
+    get:
+      tags: [Inventory]
+      summary: Инвентарь пользователя
+      parameters:
+        - in: query
+          name: rarity
+          schema:
+            $ref: '#/components/schemas/Rarity'
+          description: Фильтр по редкости
+        - in: query
+          name: set
+          schema:
+            type: string
+          description: Фильтр по набору/сету
+        - in: query
+          name: search
+          schema:
+            type: string
+          description: Поиск по имени
+      responses:
+        '200':
+          description: Список предметов с количеством
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/InventoryItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /inventory/disenchant:
+    post:
+      tags: [Inventory]
+      summary: Конвертация дубликатов в «пыль» (опциональная механика)
+      description: Эндпойнт активен, если включена механика «пыль/осколки».
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [item_id, qty]
+              properties:
+                item_id:
+                  type: string
+                qty:
+                  type: integer
+                  minimum: 1
+      responses:
+        '200':
+          description: Успешная конвертация
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dust_balance:
+                    type: integer
+                    minimum: 0
+                  inventory_item:
+                    $ref: '#/components/schemas/InventoryItem'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Недостаточно дубликатов для конвертации
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /shop/packs:
+    get:
+      tags: [Payments]
+      summary: Каталог пакетов монет
+      responses:
+        '200':
+          description: Доступные пакеты монет
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CoinPack'
+
+  /payments/create:
+    post:
+      tags: [Payments]
+      summary: Создать платежную сессию
+      description: |
+        Создает платеж для пополнения баланса. Поддерживает Telegram Stars и Bot Payments.
+        Результат зависит от провайдера (deep-link, invoice payload и т. п.).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pack_id, provider]
+              properties:
+                pack_id:
+                  type: string
+                  description: Идентификатор пакета монет
+                provider:
+                  $ref: '#/components/schemas/PaymentProvider'
+                metadata:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Платеж создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Повторная инициация с тем же Idempotency-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentSession'
+
+  /payments/webhook:
+    post:
+      tags: [Webhooks]
+      summary: Вебхук платежного провайдера
+      description: Прием нотификаций от Telegram Stars/Bot Payments. Идемпотентен по внешнему `payment_id`.
+      security:
+        - webhookSig: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentWebhookEvent'
+      responses:
+        '200':
+          description: Принято
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/cases:
+    post:
+      tags: [Admin]
+      summary: Создать кейс (draft)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaseInput'
+      responses:
+        '201':
+          description: Кейс создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    put:
+      tags: [Admin]
+      summary: Обновить метаданные кейса (без дроп‑таблицы)
+      parameters:
+        - $ref: '#/components/parameters/CaseIdQuery'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaseMetaUpdate'
+      responses:
+        '200':
+          description: Обновлено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/cases/{case_id}/weights:
+    post:
+      tags: [Admin]
+      summary: Создать новую версию дроп‑таблицы кейса
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaseDropWeightsInput'
+      responses:
+        '201':
+          description: Версия дроп‑таблицы создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/items:
+    post:
+      tags: [Admin]
+      summary: Создать предмет (стикер)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ItemInput'
+      responses:
+        '201':
+          description: Создано
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    put:
+      tags: [Admin]
+      summary: Обновить предмет
+      parameters:
+        - in: query
+          name: item_id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ItemUpdate'
+      responses:
+        '200':
+          description: Обновлено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/users/{user_id}/ban:
+    post:
+      tags: [Admin]
+      summary: Бан/заморозка пользователя
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                until:
+                  type: string
+                  format: date-time
+                  description: Необязательно. Дата окончания бана (если временный).
+      responses:
+        '200':
+          description: Пользователь забанен/заморожен
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/users/{user_id}/unban:
+    post:
+      tags: [Admin]
+      summary: Снять бан/разморозить пользователя
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: Бан снят
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/balance/adjust:
+    post:
+      tags: [Admin]
+      summary: Ручная корректировка баланса
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, amount, reason]
+              properties:
+                user_id:
+                  type: string
+                amount:
+                  type: integer
+                  description: Положительное или отрицательное значение в монетах
+                reason:
+                  type: string
+                idempotency_key:
+                  type: string
+      responses:
+        '200':
+          description: Баланс обновлен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Balance'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/promos:
+    post:
+      tags: [Admin]
+      summary: Создать промокод (однократное начисление)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, amount]
+              properties:
+                code:
+                  type: string
+                amount:
+                  type: integer
+                  minimum: 1
+                expires_at:
+                  type: string
+                  format: date-time
+                max_redemptions:
+                  type: integer
+                  minimum: 1
+      responses:
+        '201':
+          description: Промокод создан
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    webhookSig:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: HMAC подпись поставщика платежей (например, Telegram), проверяется сервером.
+
+  headers:
+    X-RateLimit-Limit:
+      description: Лимит запросов в текущем окне
+      schema: { type: integer }
+    X-RateLimit-Remaining:
+      description: Остаток запросов в текущем окне
+      schema: { type: integer }
+    X-RateLimit-Reset:
+      description: Время (unix timestamp) до сброса окна
+      schema: { type: integer, format: int64 }
+
+  parameters:
+    PageLimit:
+      in: query
+      name: limit
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+      description: Размер страницы
+    PageOffset:
+      in: query
+      name: offset
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+      description: Смещение
+    CaseId:
+      in: path
+      name: case_id
+      required: true
+      schema:
+        type: string
+    CaseIdQuery:
+      in: query
+      name: case_id
+      required: true
+      schema:
+        type: string
+    UserId:
+      in: path
+      name: user_id
+      required: true
+      schema:
+        type: string
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      schema:
+        type: string
+        minLength: 1
+      description: Уникальный ключ операции для идемпотентности
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Неавторизовано
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Нет прав доступа
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Не найдено
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: Превышен лимит запросов
+      headers:
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/X-RateLimit-Limit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/X-RateLimit-Remaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/X-RateLimit-Reset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Внутренняя ошибка сервера
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: Сервис временно недоступен
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    AuthResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+          description: JWT токен доступа
+        refresh_token:
+          type: string
+        user:
+          $ref: '#/components/schemas/UserProfile'
+        balance:
+          $ref: '#/components/schemas/Balance'
+
+    MeResponse:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/UserProfile'
+        balance:
+          $ref: '#/components/schemas/Balance'
+        stats:
+          type: object
+          properties:
+            drops_total:
+              type: integer
+              minimum: 0
+            duplicates_ratio:
+              type: number
+              format: float
+              description: Коэффициент дубликатов (0..1)
+
+    UserProfile:
+      type: object
+      properties:
+        user_id:
+          type: string
+          description: Внешний ключ — Telegram user_id
+        username:
+          type: string
+        avatar_url:
+          type: string
+          format: uri
+        country:
+          type: string
+        language:
+          type: string
+        registered_at:
+          type: string
+          format: date-time
+        banned:
+          type: boolean
+          default: false
+
+    Balance:
+      type: object
+      properties:
+        coins:
+          type: integer
+          minimum: 0
+        dust:
+          type: integer
+          minimum: 0
+          description: Опциональная внутренняя валюта за дубликаты
+
+    Rarity:
+      type: string
+      enum: [common, uncommon, rare, epic, legendary]
+
+    Item:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        rarity:
+          $ref: '#/components/schemas/Rarity'
+        image:
+          type: string
+          format: uri
+        set:
+          type: string
+        available:
+          type: boolean
+          default: true
+
+    ItemInput:
+      type: object
+      required: [name, rarity, image]
+      properties:
+        name:
+          type: string
+        rarity:
+          $ref: '#/components/schemas/Rarity'
+        image:
+          type: string
+        set:
+          type: string
+        available:
+          type: boolean
+
+    ItemUpdate:
+      allOf:
+        - $ref: '#/components/schemas/ItemInput'
+
+    InventoryItem:
+      type: object
+      properties:
+        item:
+          $ref: '#/components/schemas/Item'
+        qty:
+          type: integer
+          minimum: 0
+        obtained_at:
+          type: string
+          format: date-time
+        source_drop_id:
+          type: string
+
+    CaseSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        price_coins:
+          type: integer
+          minimum: 0
+        status:
+          type: string
+          enum: [draft, active]
+        icon:
+          type: string
+          format: uri
+        rarity_chances:
+          type: object
+          additionalProperties:
+            type: number
+            description: Процент вероятности по редкости (0..100)
+          description: Сумма процентов может быть < 100 из-за округления.
+
+    CaseDetails:
+      allOf:
+        - $ref: '#/components/schemas/CaseSummary'
+        - type: object
+          properties:
+            version:
+              type: integer
+              minimum: 1
+              description: Версия дроп‑таблицы
+            pity_enabled:
+              type: boolean
+              default: false
+              description: Флаг для будущей «мини‑гарантии»
+            items_preview:
+              type: array
+              description: Превью пула предметов (без точных весов)
+              items:
+                $ref: '#/components/schemas/Item'
+
+    CaseInput:
+      type: object
+      required: [title, price_coins, status]
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        price_coins:
+          type: integer
+          minimum: 0
+        status:
+          type: string
+          enum: [draft, active]
+        icon:
+          type: string
+          format: uri
+        rarity_chances:
+          type: object
+          additionalProperties:
+            type: number
+        pity_enabled:
+          type: boolean
+
+    CaseMetaUpdate:
+      type: object
+      description: Обновление метаданных кейса (без дроп‑таблицы); частичное.
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        price_coins:
+          type: integer
+          minimum: 0
+        status:
+          type: string
+          enum: [draft, active]
+        icon:
+          type: string
+          format: uri
+        rarity_chances:
+          type: object
+          additionalProperties:
+            type: number
+        pity_enabled:
+          type: boolean
+      additionalProperties: false
+      minProperties: 1
+
+    CaseDropWeightsInput:
+      type: object
+      description: |
+        Весовая таблица предметов. Веса нормализуются сервером; создается новая версия.
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [item_id, weight]
+            properties:
+              item_id:
+                type: string
+              weight:
+                type: integer
+                minimum: 1
+
+    OpenCaseResponse:
+      type: object
+      properties:
+        drop_id:
+          type: string
+        item:
+          $ref: '#/components/schemas/Item'
+        balance:
+          $ref: '#/components/schemas/Balance'
+        batch_seed_hash:
+          type: string
+          description: Опциональный хэш сида для прозрачности RNG
+
+    Drop:
+      type: object
+      properties:
+        id:
+          type: string
+        case_id:
+          type: string
+        item:
+          $ref: '#/components/schemas/Item'
+        rarity:
+          $ref: '#/components/schemas/Rarity'
+        created_at:
+          type: string
+          format: date-time
+        batch_seed_hash:
+          type: string
+
+    CoinPack:
+      type: object
+      properties:
+        id:
+          type: string
+        provider:
+          $ref: '#/components/schemas/PaymentProvider'
+        coins:
+          type: integer
+          minimum: 1
+        price_usd:
+          type: number
+          format: float
+        price_stars:
+          type: integer
+        active:
+          type: boolean
+          default: true
+
+    PaymentProvider:
+      type: string
+      enum: [telegram_stars, bot_payments]
+
+    PaymentStatus:
+      type: string
+      enum: [pending, succeeded, failed, refunded]
+
+    PaymentSession:
+      type: object
+      properties:
+        payment_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        provider:
+          $ref: '#/components/schemas/PaymentProvider'
+        amount_coins:
+          type: integer
+        deep_link:
+          type: string
+          format: uri
+        invoice_payload:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    PaymentWebhookEvent:
+      type: object
+      properties:
+        provider:
+          $ref: '#/components/schemas/PaymentProvider'
+        external_payment_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        amount:
+          type: integer
+          description: Сумма в минимальных единицах провайдера
+        currency:
+          type: string
+          description: Валюта провайдера (например, XTR для Stars)
+        signature:
+          type: string
+          description: Подпись провайдера (дублируется в заголовке для удобства)
+        metadata:
+          type: object
+          additionalProperties: true
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Код ошибки
+        message:
+          type: string
+        trace_id:
+          type: string
+
+x-codegen-notes: |
+  - Рекомендуется генерировать серверные заглушки и клиентский SDK из данной спецификации (OpenAPI 3.1).
+  - Для критичных эндпойнтов используйте ретраи только с идентичным `Idempotency-Key`.
+  - Ответы содержат стандартные rate‑limit заголовки; реализуйте глобальный лимитер по user_id/IP.
